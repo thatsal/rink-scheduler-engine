@@ -4,27 +4,48 @@ import streamlit as st
 import pandas as pd
 
 from excel_io import load_excel, sample_tables, tables_to_excel_bytes
-from scheduler_core import REQUIRED_SHEETS, build_all_schedules, normalize_tables
+from scheduler_core import REQUIRED_SHEETS, build_all_schedules, normalize_tables, get_empty_tables
 
 st.set_page_config(page_title="Nor-Cal Hockey Scheduler", page_icon="🏒", layout="wide")
 
 st.title("🏒 Nor-Cal Hockey Scheduler MVP")
 st.caption("Python + Streamlit version. Upload/edit Excel tables, generate schedules, review audit warnings, download results.")
 
+if "tables" not in st.session_state:
+    st.session_state.tables = sample_tables()
+
 with st.sidebar:
     st.header("Workflow")
     st.markdown(
         """
-1. Upload an Excel workbook, or start from sample data.  
-2. Edit the setup tables.  
-3. Generate schedules.  
-4. Download the output workbook.
+1. Download the template workbook, or use your own workbook.  
+2. Fill in leagues, teams, time slots, and blackouts.  
+3. Upload the workbook.  
+4. Edit tables if needed.  
+5. Generate schedules.  
+6. Download the finished workbook.
         """
     )
-    uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
 
-if "tables" not in st.session_state:
-    st.session_state.tables = sample_tables()
+    template_bytes = tables_to_excel_bytes(get_empty_tables())
+    st.download_button(
+        "📥 Download blank template",
+        data=template_bytes,
+        file_name="norcal_scheduler_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    current_bytes = tables_to_excel_bytes(st.session_state.tables)
+    st.download_button(
+        "📥 Download sample/current workbook",
+        data=current_bytes,
+        file_name="norcal_scheduler_inputs.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
 
 if uploaded is not None:
     try:
@@ -34,10 +55,11 @@ if uploaded is not None:
         st.error(f"Could not load workbook: {exc}")
 
 st.subheader("Setup Tables")
-st.info("This replaces the old Google Sheets/App Script editing layer. These tables are the source for schedule generation.")
+st.info("Edit the tables below or upload a completed workbook. These replace the old Google Sheets/App Script editing layer.")
 
 tabs = st.tabs(list(REQUIRED_SHEETS.keys()))
 updated_tables = {}
+
 for tab, sheet_name in zip(tabs, REQUIRED_SHEETS.keys()):
     with tab:
         df = st.session_state.tables.get(sheet_name, pd.DataFrame(columns=REQUIRED_SHEETS[sheet_name]))
@@ -53,13 +75,15 @@ for tab, sheet_name in zip(tabs, REQUIRED_SHEETS.keys()):
 st.session_state.tables = normalize_tables(updated_tables)
 
 left, right = st.columns([1, 2])
+
 with left:
     generate = st.button("Generate Schedules", type="primary", use_container_width=True)
+
 with right:
-    template_bytes = tables_to_excel_bytes(st.session_state.tables)
+    input_bytes = tables_to_excel_bytes(st.session_state.tables)
     st.download_button(
         "Download current input workbook",
-        data=template_bytes,
+        data=input_bytes,
         file_name="norcal_scheduler_inputs.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
@@ -76,6 +100,7 @@ if "schedule" in st.session_state:
 
     st.subheader("Audit")
     audit = st.session_state.audit
+
     if audit.empty:
         st.success("No audit warnings generated.")
     else:
@@ -87,7 +112,12 @@ if "schedule" in st.session_state:
         filtered = audit[audit["Severity"].isin(severity_filter)] if severity_filter else audit
         st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-    output_bytes = tables_to_excel_bytes(st.session_state.tables, st.session_state.schedule, st.session_state.audit)
+    output_bytes = tables_to_excel_bytes(
+        st.session_state.tables,
+        st.session_state.schedule,
+        st.session_state.audit,
+    )
+
     st.download_button(
         "Download schedule workbook",
         data=output_bytes,
