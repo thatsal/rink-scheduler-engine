@@ -280,3 +280,4 @@ def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, 
     schedule_out = pd.concat(all_schedule, ignore_index=True) if all_schedule else pd.DataFrame(columns=SCHEDULE_COLUMNS)
     audit_out = pd.concat(all_audit, ignore_index=True) if all_audit else pd.DataFrame(columns=AUDIT_COLUMNS)
     return schedule_out, audit_out
+
