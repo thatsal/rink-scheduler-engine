@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
+from pathlib import Path
 
 from excel_io import load_excel, sample_tables, tables_to_excel_bytes
 from scheduler_core import REQUIRED_SHEETS, build_all_schedules, normalize_tables
@@ -15,13 +16,28 @@ with st.sidebar:
     st.header("Workflow")
     st.markdown(
         """
-1. Upload an Excel workbook, or start from sample data.  
-2. Edit the setup tables.  
-3. Generate schedules.  
-4. Download the output workbook.
+1. Download the template workbook.  
+2. Fill in leagues, teams, time slots, and blackouts.  
+3. Upload the completed workbook.  
+4. Generate schedules.  
+5. Download the output workbook.
         """
     )
-    uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+
+    template_path = Path("template.xlsx")
+    if template_path.exists():
+        with template_path.open("rb") as file:
+            st.download_button(
+                label="📥 Download Template Workbook",
+                data=file,
+                file_name="NorCal_Scheduler_Template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+    else:
+        st.warning("template.xlsx was not found in the repo. Upload a template.xlsx file to enable the template download button.")
+
+    uploaded = st.file_uploader("Upload completed Excel workbook", type=["xlsx"])
 
 if "tables" not in st.session_state:
     st.session_state.tables = sample_tables()
