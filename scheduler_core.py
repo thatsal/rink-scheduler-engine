@@ -20,6 +20,12 @@ SCHEDULE_COLUMNS = [
 
 AUDIT_COLUMNS = ["LeagueID", "LeagueName", "Severity", "Week", "Date", "Time", "Issue", "Details", "RowRef"]
 
+SUMMARY_COLUMNS = [
+    "LeagueID", "LeagueName", "TeamID", "TeamName",
+    "Games", "Home", "Away", "Byes", "Doubleheaders", "LateGames",
+    "HomeAwayDiff", "TargetGamesDiff"
+]
+
 # MVP scheduling preferences.
 # Lower score = better option.
 SCHEDULE_WEIGHTS = {
@@ -388,6 +394,89 @@ def audit(league_id, league_name, severity, week, day, time, issue, details, row
     }
 
 
+
+def build_schedule_summary(
+    schedule: pd.DataFrame,
+    team_ids: List[str],
+    team_map: Dict[str, str],
+    league_id: str,
+    league_name: str,
+) -> pd.DataFrame:
+    """Create a team-by-team balance summary for easier schedule review."""
+    counts = {tid: 0 for tid in team_ids}
+    home_counts = {tid: 0 for tid in team_ids}
+    late_counts = {tid: 0 for tid in team_ids}
+    byes = {tid: 0 for tid in team_ids}
+    doubleheaders = {tid: 0 for tid in team_ids}
+
+    if schedule.empty:
+        return pd.DataFrame(columns=SUMMARY_COLUMNS)
+
+    max_slot = schedule["SlotOrder"].dropna().max()
+    weekly_counts: dict[tuple[int, str], list[int]] = {}
+
+    for _, game in schedule.iterrows():
+        home = clean_str(game.get("HomeTeamID"))
+        away = clean_str(game.get("AwayTeamID"))
+        if not home or not away:
+            continue
+
+        week_value = pd.to_numeric(game.get("Week"), errors="coerce")
+        if pd.isna(week_value):
+            continue
+        week = int(week_value)
+
+        slot_value = pd.to_numeric(game.get("SlotOrder"), errors="coerce")
+        if pd.isna(slot_value):
+            continue
+        slot_order = int(slot_value)
+
+        for tid in [home, away]:
+            if tid not in counts:
+                continue
+            counts[tid] += 1
+            weekly_counts.setdefault((week, tid), []).append(slot_order)
+            if not pd.isna(max_slot) and slot_order == int(max_slot):
+                late_counts[tid] += 1
+
+        if home in home_counts:
+            home_counts[home] += 1
+
+    weeks = sorted(pd.to_numeric(schedule["Week"], errors="coerce").dropna().astype(int).unique())
+    for week in weeks:
+        for tid in team_ids:
+            slot_list = weekly_counts.get((week, tid), [])
+            if not slot_list:
+                byes[tid] += 1
+            if len(slot_list) > 1:
+                doubleheaders[tid] += 1
+
+    game_values = list(counts.values())
+    target_games = round(sum(game_values) / len(game_values), 2) if game_values else 0
+
+    rows = []
+    for tid in team_ids:
+        games = counts.get(tid, 0)
+        home = home_counts.get(tid, 0)
+        away = games - home
+        rows.append({
+            "LeagueID": league_id,
+            "LeagueName": league_name,
+            "TeamID": tid,
+            "TeamName": team_map.get(tid, tid),
+            "Games": games,
+            "Home": home,
+            "Away": away,
+            "Byes": byes.get(tid, 0),
+            "Doubleheaders": doubleheaders.get(tid, 0),
+            "LateGames": late_counts.get(tid, 0),
+            "HomeAwayDiff": abs(home - away),
+            "TargetGamesDiff": round(games - target_games, 2),
+        })
+
+    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS).sort_values(["LeagueID", "TeamName"]).reset_index(drop=True)
+
+
 def audit_schedule(
     schedule: pd.DataFrame,
     team_ids: List[str],
@@ -504,10 +593,11 @@ def format_team_counts(counts: dict[str, int], team_map: dict[str, str]) -> str:
     return ", ".join(f"{team_map.get(team, team)}={value}" for team, value in counts.items())
 
 
-def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     tables = normalize_tables(tables)
     all_schedule: List[pd.DataFrame] = []
     all_audit: List[pd.DataFrame] = []
+    all_summary: List[pd.DataFrame] = []
 
     for _, league in get_active_leagues(tables["Leagues"]).iterrows():
         schedule, audit_df = build_league_schedule(
@@ -519,6 +609,16 @@ def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, 
         all_schedule.append(schedule)
         all_audit.append(audit_df)
 
+        league_id = clean_str(league.get("LeagueID"))
+        league_name = clean_str(league.get("LeagueName")) or league_id
+        teams = tables["Teams"][tables["Teams"]["LeagueID"].map(clean_str) == league_id].copy()
+        teams = teams[teams["Active"].map(truthy)]
+        team_map = {clean_str(r.TeamID): clean_str(r.TeamName) for r in teams.itertuples(index=False)}
+        team_ids = [tid for tid in team_map if tid]
+        all_summary.append(build_schedule_summary(schedule, team_ids, team_map, league_id, league_name))
+
     schedule_out = pd.concat(all_schedule, ignore_index=True) if all_schedule else pd.DataFrame(columns=SCHEDULE_COLUMNS)
     audit_out = pd.concat(all_audit, ignore_index=True) if all_audit else pd.DataFrame(columns=AUDIT_COLUMNS)
-    return schedule_out, audit_out
+    summary_out = pd.concat(all_summary, ignore_index=True) if all_summary else pd.DataFrame(columns=SUMMARY_COLUMNS)
+    return schedule_out, audit_out, summary_out
+
