@@ -23,7 +23,7 @@ AUDIT_COLUMNS = ["LeagueID", "LeagueName", "Severity", "Week", "Date", "Time", "
 SUMMARY_COLUMNS = [
     "LeagueID", "LeagueName", "TeamID", "TeamName",
     "Games", "Home", "Away", "Byes", "Doubleheaders", "LateGames",
-    "HomeAwayDiff", "TargetGamesDiff"
+    "HomeAwayDiff", "TargetGamesDiff", "TimeSlotImbalance"
 ]
 
 # MVP scheduling preferences.
@@ -36,8 +36,10 @@ SCHEDULE_WEIGHTS = {
     "doubleheader_penalty": 30,
     # Home/away still matters, but not more than total games.
     "balance_home_away": 45,
-    # Late slot balance matters because nobody wants to live in the last game.
-    "balance_late_games": 50,
+    # Balance all time slots, not just the latest slot.
+    "balance_time_slots": 70,
+    # Last slot still gets a small extra penalty because late games usually feel worse.
+    "extra_late_slot": 20,
     # Repeat-opponent spacing.
     "avoid_repeat_opponent": 45,
     "avoid_recent_repeat": 130,
@@ -144,6 +146,19 @@ def choose_home_away(team_a: str, team_b: str, stats: dict) -> tuple[str, str]:
     return team_b, team_a
 
 
+def team_time_slot_imbalance(team: str, stats: dict) -> int:
+    """Return the spread between a team's most-used and least-used time slot."""
+    slot_counts = stats.get("slot_counts", {}).get(team, {})
+    if not slot_counts:
+        return 0
+    values = list(slot_counts.values())
+    return max(values) - min(values)
+
+
+def team_slot_count(team: str, slot_order: int, stats: dict) -> int:
+    return stats.get("slot_counts", {}).get(team, {}).get(int(slot_order), 0)
+
+
 def calculate_week_targets(
     team_ids: List[str],
     slot_count: int,
@@ -180,8 +195,8 @@ def calculate_week_targets(
                     stats["games"].get(t, 0),
                     # Then spread doubleheaders fairly.
                     stats["doubleheaders"].get(t, 0),
-                    # Then avoid piling on late games.
-                    stats["late"].get(t, 0),
+                    # Then avoid teams already stuck in a lopsided time-slot pattern.
+                    team_time_slot_imbalance(t, stats),
                     t,
                 ),
             )
@@ -195,7 +210,7 @@ def calculate_week_targets(
             key=lambda t: (
                 stats["games"].get(t, 0),
                 -stats["byes"].get(t, 0),
-                stats["late"].get(t, 0),
+                team_time_slot_imbalance(t, stats),
                 t,
             ),
         )
@@ -289,15 +304,27 @@ def score_pair(
             # If a team has fewer games overall, doubleheader is less bad.
             score -= max(0, min_games + 1 - stats["games"][team]) * 70
 
-    # Avoid too many late games.
+    # Balance every time slot. If this is Slot 2, prefer teams that have
+    # had fewer Slot 2 games. This prevents teams from getting stuck in a
+    # repeated time pattern, not just too many late games.
+    min_this_slot = min(team_slot_count(t, slot_order, stats) for t in stats["games"]) if stats.get("games") else 0
+    for team in teams:
+        this_slot_count = team_slot_count(team, slot_order, stats)
+        score += (this_slot_count - min_this_slot) * SCHEDULE_WEIGHTS["balance_time_slots"]
+        # Also penalize the projected per-team slot spread after this game.
+        projected_counts = dict(stats.get("slot_counts", {}).get(team, {}))
+        projected_counts[int(slot_order)] = projected_counts.get(int(slot_order), 0) + 1
+        if projected_counts:
+            score += (max(projected_counts.values()) - min(projected_counts.values())) * 35
+
+    # Keep a smaller extra penalty for the last slot because it usually feels
+    # worse than other times, but it is no longer the only slot being balanced.
     if int(slot_order) == int(max_slot_order):
         min_late = min(stats["late"].values()) if stats["late"] else 0
         for team in teams:
-            score += (stats["late"][team] - min_late) * SCHEDULE_WEIGHTS["balance_late_games"]
-            # Small extra nudge: if a team is already ahead in games, avoid also
-            # handing them the late slot.
+            score += (stats["late"][team] - min_late) * SCHEDULE_WEIGHTS["extra_late_slot"]
             if stats["games"][team] > min_games:
-                score += 60
+                score += 35
 
     # Avoid repeat opponents and especially recent repeat opponents.
     pk = pair_key(team_a, team_b)
@@ -366,11 +393,13 @@ def build_league_schedule(
     slots = slots.head(games_per_night)
 
     max_slot_order = int(slots["SlotOrder"].max())
+    slot_orders = [int(x) for x in slots["SlotOrder"].tolist()]
 
     stats = {
         "games": {team: 0 for team in team_ids},
         "home": {team: 0 for team in team_ids},
         "late": {team: 0 for team in team_ids},
+        "slot_counts": {team: {slot_order: 0 for slot_order in slot_orders} for team in team_ids},
         "byes": {team: 0 for team in team_ids},
         "doubleheaders": {team: 0 for team in team_ids},
         "opponent_counts": {},
@@ -514,7 +543,10 @@ def build_league_schedule(
                 stats["games"][team] += 1
                 week_counts[team] += 1
                 week_last_slot[team] = slot_index
-                if int(slot["SlotOrder"]) == max_slot_order:
+                slot_order_value = int(slot["SlotOrder"])
+                stats["slot_counts"].setdefault(team, {}).setdefault(slot_order_value, 0)
+                stats["slot_counts"][team][slot_order_value] += 1
+                if slot_order_value == max_slot_order:
                     stats["late"][team] += 1
 
             stats["home"][home] += 1
@@ -572,6 +604,8 @@ def build_schedule_summary(
     counts = {tid: 0 for tid in team_ids}
     home_counts = {tid: 0 for tid in team_ids}
     late_counts = {tid: 0 for tid in team_ids}
+    slot_orders = sorted(pd.to_numeric(schedule["SlotOrder"], errors="coerce").dropna().astype(int).unique()) if not schedule.empty else []
+    slot_counts = {tid: {slot_order: 0 for slot_order in slot_orders} for tid in team_ids}
     byes = {tid: 0 for tid in team_ids}
     doubleheaders = {tid: 0 for tid in team_ids}
 
@@ -602,6 +636,8 @@ def build_schedule_summary(
                 continue
             counts[tid] += 1
             weekly_counts.setdefault((week, tid), []).append(slot_order)
+            slot_counts.setdefault(tid, {}).setdefault(slot_order, 0)
+            slot_counts[tid][slot_order] += 1
             if not pd.isna(max_slot) and slot_order == int(max_slot):
                 late_counts[tid] += 1
 
@@ -625,7 +661,7 @@ def build_schedule_summary(
         games = counts.get(tid, 0)
         home = home_counts.get(tid, 0)
         away = games - home
-        rows.append({
+        row = {
             "LeagueID": league_id,
             "LeagueName": league_name,
             "TeamID": tid,
@@ -638,9 +674,15 @@ def build_schedule_summary(
             "LateGames": late_counts.get(tid, 0),
             "HomeAwayDiff": abs(home - away),
             "TargetGamesDiff": round(games - target_games, 2),
-        })
+        }
+        for slot_order in slot_orders:
+            row[f"Slot{slot_order}"] = slot_counts.get(tid, {}).get(slot_order, 0)
+        slot_values = [slot_counts.get(tid, {}).get(slot_order, 0) for slot_order in slot_orders]
+        row["TimeSlotImbalance"] = max(slot_values) - min(slot_values) if slot_values else 0
+        rows.append(row)
 
-    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS).sort_values(["LeagueID", "TeamName"]).reset_index(drop=True)
+    dynamic_columns = SUMMARY_COLUMNS[:12] + [f"Slot{slot_order}" for slot_order in slot_orders] + ["TimeSlotImbalance"]
+    return pd.DataFrame(rows).reindex(columns=dynamic_columns).sort_values(["LeagueID", "TeamName"]).reset_index(drop=True)
 
 
 def audit_schedule(
@@ -658,6 +700,8 @@ def audit_schedule(
     counts = {tid: 0 for tid in team_ids}
     home_counts = {tid: 0 for tid in team_ids}
     late_counts = {tid: 0 for tid in team_ids}
+    slot_orders = sorted(pd.to_numeric(schedule["SlotOrder"], errors="coerce").dropna().astype(int).unique())
+    slot_counts = {tid: {slot_order: 0 for slot_order in slot_orders} for tid in team_ids}
     byes = {tid: 0 for tid in team_ids}
     doubleheaders = {tid: 0 for tid in team_ids}
 
@@ -672,8 +716,11 @@ def audit_schedule(
 
         for tid in [home, away]:
             counts[tid] = counts.get(tid, 0) + 1
-            weekly_counts.setdefault((int(game["Week"]), tid), []).append(int(game["SlotOrder"]))
-            if int(game["SlotOrder"]) == int(max_slot):
+            slot_order = int(game["SlotOrder"])
+            weekly_counts.setdefault((int(game["Week"]), tid), []).append(slot_order)
+            slot_counts.setdefault(tid, {}).setdefault(slot_order, 0)
+            slot_counts[tid][slot_order] += 1
+            if slot_order == int(max_slot):
                 late_counts[tid] = late_counts.get(tid, 0) + 1
 
         home_counts[home] = home_counts.get(home, 0) + 1
@@ -731,6 +778,23 @@ def audit_schedule(
     if dh_values and max(dh_values) - min(dh_values) > 1:
         rows.append(audit(league_id, league_name, "Info", None, None, None, "Uneven doubleheader count", format_team_counts(doubleheaders, team_map)))
 
+
+    # Time-slot distribution: audit every slot, not only the latest one.
+    for tid in team_ids:
+        values = [slot_counts.get(tid, {}).get(slot_order, 0) for slot_order in slot_orders]
+        if values and max(values) - min(values) > 2:
+            slot_detail = ", ".join(f"Slot{slot_order}={slot_counts.get(tid, {}).get(slot_order, 0)}" for slot_order in slot_orders)
+            rows.append(audit(
+                league_id,
+                league_name,
+                "Info",
+                None,
+                None,
+                None,
+                "Time slot imbalance",
+                f"{team_map.get(tid, tid)} has uneven time slot distribution: {slot_detail}",
+            ))
+
     for tid in team_ids:
         away_count = counts[tid] - home_counts.get(tid, 0)
         if abs(home_counts.get(tid, 0) - away_count) > 2:
@@ -765,6 +829,7 @@ def audit_schedule(
             "byes": byes.get(tid, 0),
             "doubleheaders": doubleheaders.get(tid, 0),
             "late": late_counts.get(tid, 0),
+            "slots": {f"Slot{slot_order}": slot_counts.get(tid, {}).get(slot_order, 0) for slot_order in slot_orders},
         }
         for tid in team_ids
     }
@@ -804,4 +869,3 @@ def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, 
     audit_out = pd.concat(all_audit, ignore_index=True) if all_audit else pd.DataFrame(columns=AUDIT_COLUMNS)
     summary_out = pd.concat(all_summary, ignore_index=True) if all_summary else pd.DataFrame(columns=SUMMARY_COLUMNS)
     return schedule_out, audit_out, summary_out
-
