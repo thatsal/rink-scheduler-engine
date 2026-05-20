@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
 from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 
 from excel_io import load_excel, sample_tables, tables_to_excel_bytes
 from scheduler_core import REQUIRED_SHEETS, build_all_schedules, normalize_tables
@@ -10,7 +11,7 @@ from scheduler_core import REQUIRED_SHEETS, build_all_schedules, normalize_table
 st.set_page_config(page_title="Nor-Cal Hockey Scheduler", page_icon="🏒", layout="wide")
 
 st.title("🏒 Nor-Cal Hockey Scheduler MVP")
-st.caption("Python + Streamlit version. Upload/edit Excel tables, generate schedules, review audit warnings, download results.")
+st.caption("Python + Streamlit version. Upload/edit Excel tables, generate schedules, review balance summary/audit warnings, download results.")
 
 with st.sidebar:
     st.header("Workflow")
@@ -20,7 +21,8 @@ with st.sidebar:
 2. Fill in leagues, teams, time slots, and blackouts.  
 3. Upload the completed workbook.  
 4. Generate schedules.  
-5. Download the output workbook.
+5. Review the summary/audit.  
+6. Download the output workbook.
         """
     )
 
@@ -72,23 +74,34 @@ left, right = st.columns([1, 2])
 with left:
     generate = st.button("Generate Schedules", type="primary", use_container_width=True)
 with right:
-    template_bytes = tables_to_excel_bytes(st.session_state.tables)
+    input_bytes = tables_to_excel_bytes(st.session_state.tables)
     st.download_button(
         "Download current input workbook",
-        data=template_bytes,
+        data=input_bytes,
         file_name="norcal_scheduler_inputs.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
 if generate:
-    schedule, audit = build_all_schedules(st.session_state.tables)
+    schedule, audit, summary = build_all_schedules(st.session_state.tables)
     st.session_state.schedule = schedule
     st.session_state.audit = audit
+    st.session_state.summary = summary
 
 if "schedule" in st.session_state:
     st.subheader("Generated Schedule")
     st.dataframe(st.session_state.schedule, use_container_width=True, hide_index=True)
+
+    st.subheader("Schedule Summary")
+    summary = st.session_state.get("summary", pd.DataFrame())
+    if summary.empty:
+        st.info("No summary available yet.")
+    else:
+        league_options = sorted(summary["LeagueName"].dropna().unique())
+        selected_leagues = st.multiselect("Filter summary by league", league_options, default=league_options)
+        filtered_summary = summary[summary["LeagueName"].isin(selected_leagues)] if selected_leagues else summary
+        st.dataframe(filtered_summary, use_container_width=True, hide_index=True)
 
     st.subheader("Audit")
     audit = st.session_state.audit
@@ -103,7 +116,12 @@ if "schedule" in st.session_state:
         filtered = audit[audit["Severity"].isin(severity_filter)] if severity_filter else audit
         st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-    output_bytes = tables_to_excel_bytes(st.session_state.tables, st.session_state.schedule, st.session_state.audit)
+    output_bytes = tables_to_excel_bytes(
+        st.session_state.tables,
+        st.session_state.schedule,
+        st.session_state.audit,
+        st.session_state.summary,
+    )
     st.download_button(
         "Download schedule workbook",
         data=output_bytes,
@@ -115,3 +133,4 @@ if "schedule" in st.session_state:
 else:
     st.subheader("Expected workbook sheets")
     st.write({sheet: cols for sheet, cols in REQUIRED_SHEETS.items()})
+
