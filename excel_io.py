@@ -41,7 +41,12 @@ def load_excel(file_obj) -> Dict[str, pd.DataFrame]:
     return normalize_tables(workbook)
 
 
-def tables_to_excel_bytes(tables: Dict[str, pd.DataFrame], schedule: pd.DataFrame | None = None, audit: pd.DataFrame | None = None) -> bytes:
+def tables_to_excel_bytes(
+    tables: Dict[str, pd.DataFrame],
+    schedule: pd.DataFrame | None = None,
+    audit: pd.DataFrame | None = None,
+    summary: pd.DataFrame | None = None,
+) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         normalized = normalize_tables(tables)
@@ -52,6 +57,9 @@ def tables_to_excel_bytes(tables: Dict[str, pd.DataFrame], schedule: pd.DataFram
         if schedule is not None:
             schedule.to_excel(writer, sheet_name="Schedule", index=False)
             _format_sheet(writer, "Schedule", schedule)
+        if summary is not None:
+            summary.to_excel(writer, sheet_name="Summary", index=False)
+            _format_sheet(writer, "Summary", summary)
         if audit is not None:
             audit.to_excel(writer, sheet_name="Audit", index=False)
             _format_sheet(writer, "Audit", audit)
