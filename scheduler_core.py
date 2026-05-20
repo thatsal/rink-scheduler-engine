@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timedelta, date
+from itertools import combinations
 from typing import Dict, List, Tuple, Any
 
 import pandas as pd
@@ -19,6 +19,20 @@ SCHEDULE_COLUMNS = [
 ]
 
 AUDIT_COLUMNS = ["LeagueID", "LeagueName", "Severity", "Week", "Date", "Time", "Issue", "Details", "RowRef"]
+
+# MVP scheduling preferences.
+# Lower score = better option.
+SCHEDULE_WEIGHTS = {
+    "balance_games": 100,
+    "balance_home_away": 35,
+    "balance_late_games": 25,
+    "avoid_repeat_opponent": 30,
+    "avoid_recent_repeat": 60,
+    "doubleheader_penalty": 18,
+}
+
+MAX_GAMES_PER_TEAM_PER_WEEK = 2
+DOUBLEHEADERS_MUST_BE_BACK_TO_BACK = True
 
 
 def truthy(value: Any) -> bool:
@@ -50,11 +64,10 @@ def as_time_label(value: Any) -> str:
     if value is None or pd.isna(value):
         return ""
     if isinstance(value, datetime):
-        return value.strftime("%-I:%M %p")
+        return value.strftime("%I:%M %p").lstrip("0")
     parsed = pd.to_datetime(value, errors="coerce")
     if not pd.isna(parsed):
-        # If input was a true date, still only use the time part.
-        return parsed.strftime("%-I:%M %p")
+        return parsed.strftime("%I:%M %p").lstrip("0")
     return str(value).strip()
 
 
@@ -67,31 +80,6 @@ def normalize_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]
                 df[col] = None
         normalized[sheet] = df[cols].copy()
     return normalized
-
-
-def round_robin_pairs(team_ids: List[str]) -> List[List[Tuple[str, str]]]:
-    """Circle-method round robin. Adds BYE for odd team counts."""
-    teams = list(team_ids)
-    if len(teams) < 2:
-        return []
-    if len(teams) % 2 == 1:
-        teams.append("BYE")
-
-    n = len(teams)
-    rounds: List[List[Tuple[str, str]]] = []
-    rotation = teams[:]
-
-    for round_index in range(n - 1):
-        pairs: List[Tuple[str, str]] = []
-        for i in range(n // 2):
-            a = rotation[i]
-            b = rotation[n - 1 - i]
-            if "BYE" not in (a, b):
-                # Alternate home/away each round to avoid one-sided schedules.
-                pairs.append((a, b) if round_index % 2 == 0 else (b, a))
-        rounds.append(pairs)
-        rotation = [rotation[0]] + [rotation[-1]] + rotation[1:-1]
-    return rounds
 
 
 def is_blackout(check_date: date, blackouts: pd.DataFrame, league_id: str) -> Tuple[bool, str]:
@@ -114,6 +102,107 @@ def get_active_leagues(leagues: pd.DataFrame) -> pd.DataFrame:
     df["LeagueID"] = df["LeagueID"].map(clean_str)
     df["Status"] = df["Status"].map(clean_str)
     return df[df["LeagueID"].ne("") & ~df["Status"].str.lower().isin(["inactive", "closed", "done"])]
+
+
+def pair_key(team_a: str, team_b: str) -> tuple[str, str]:
+    return tuple(sorted((team_a, team_b)))
+
+
+def choose_home_away(team_a: str, team_b: str, stats: dict) -> tuple[str, str]:
+    """Choose home team based on current home/away imbalance."""
+    def orientation_penalty(home: str, away: str) -> int:
+        home_after = stats["home"][home] + 1
+        away_after = stats["games"][home] + 1 - home_after
+        home_diff_home = abs(home_after - away_after)
+
+        away_home_after = stats["home"][away]
+        away_away_after = stats["games"][away] + 1 - away_home_after
+        away_diff = abs(away_home_after - away_away_after)
+
+        return home_diff_home + away_diff
+
+    if orientation_penalty(team_a, team_b) <= orientation_penalty(team_b, team_a):
+        return team_a, team_b
+    return team_b, team_a
+
+
+def valid_pair_for_slot(
+    team_a: str,
+    team_b: str,
+    slot_index: int,
+    week_counts: dict[str, int],
+    week_last_slot: dict[str, int],
+    week_pairs: set[tuple[str, str]],
+) -> bool:
+    if team_a == team_b:
+        return False
+    if pair_key(team_a, team_b) in week_pairs:
+        return False
+
+    for team in (team_a, team_b):
+        if week_counts.get(team, 0) >= MAX_GAMES_PER_TEAM_PER_WEEK:
+            return False
+
+        # If this would be the team's second game this week, require it to be
+        # immediately after their first game. Nobody wants to wait for game two.
+        if week_counts.get(team, 0) == 1 and DOUBLEHEADERS_MUST_BE_BACK_TO_BACK:
+            if week_last_slot.get(team) != slot_index - 1:
+                return False
+
+    return True
+
+
+def score_pair(
+    team_a: str,
+    team_b: str,
+    slot_order: int,
+    max_slot_order: int,
+    current_week: int,
+    stats: dict,
+    week_counts: dict[str, int],
+) -> float:
+    teams = (team_a, team_b)
+    min_games = min(stats["games"].values()) if stats["games"] else 0
+    score = 0.0
+
+    # Prefer teams with fewer total games.
+    for team in teams:
+        score += (stats["games"][team] - min_games) * SCHEDULE_WEIGHTS["balance_games"]
+
+    # Controlled doubleheaders are allowed, but avoid them unless they help fill/balance the schedule.
+    for team in teams:
+        if week_counts.get(team, 0) == 1:
+            score += SCHEDULE_WEIGHTS["doubleheader_penalty"]
+            # If a team has fewer games overall, doubleheader is less bad.
+            score -= max(0, min_games + 1 - stats["games"][team]) * 10
+
+    # Avoid too many late games.
+    if int(slot_order) == int(max_slot_order):
+        min_late = min(stats["late"].values()) if stats["late"] else 0
+        for team in teams:
+            score += (stats["late"][team] - min_late) * SCHEDULE_WEIGHTS["balance_late_games"]
+
+    # Avoid repeat opponents and especially recent repeat opponents.
+    pk = pair_key(team_a, team_b)
+    score += stats["opponent_counts"].get(pk, 0) * SCHEDULE_WEIGHTS["avoid_repeat_opponent"]
+
+    last_met = stats["last_met_week"].get(pk)
+    if last_met is not None:
+        gap = current_week - last_met
+        if gap <= 1:
+            score += SCHEDULE_WEIGHTS["avoid_recent_repeat"] * 2
+        elif gap == 2:
+            score += SCHEDULE_WEIGHTS["avoid_recent_repeat"]
+
+    # Choose the pairing that will likely create the smallest home/away imbalance.
+    home, away = choose_home_away(team_a, team_b, stats)
+    home_after = stats["home"][home] + 1
+    home_away_after = stats["games"][home] + 1 - home_after
+    away_home_after = stats["home"][away]
+    away_away_after = stats["games"][away] + 1 - away_home_after
+    score += (abs(home_after - home_away_after) + abs(away_home_after - away_away_after)) * SCHEDULE_WEIGHTS["balance_home_away"]
+
+    return score
 
 
 def build_league_schedule(
@@ -159,20 +248,21 @@ def build_league_schedule(
         games_per_night = len(slots)
     slots = slots.head(games_per_night)
 
-    total_slots = weeks * len(slots)
-    rounds = round_robin_pairs(team_ids)
-    flattened: List[Tuple[str, str]] = []
-    while len(flattened) < total_slots:
-        for rr_round in rounds:
-            flattened.extend(rr_round)
-            if len(flattened) >= total_slots:
-                break
+    max_slot_order = int(slots["SlotOrder"].max())
 
-    if len(team_ids) % 2 == 1:
-        audit_rows.append(audit(league_id, league_name, "Info", None, None, None, "Odd team count", "A bye is expected each round because this league has an odd number of teams."))
+    stats = {
+        "games": {team: 0 for team in team_ids},
+        "home": {team: 0 for team in team_ids},
+        "late": {team: 0 for team in team_ids},
+        "byes": {team: 0 for team in team_ids},
+        "doubleheaders": {team: 0 for team in team_ids},
+        "opponent_counts": {},
+        "last_met_week": {},
+    }
 
-    game_index = 0
+    all_pairs = list(combinations(team_ids, 2))
     week_date = start
+
     for week in range(1, weeks + 1):
         pushed = 0
         while True:
@@ -186,10 +276,65 @@ def build_league_schedule(
                 audit_rows.append(audit(league_id, league_name, "Error", week, week_date, None, "Too many blackout pushes", "Stopped after 20 pushes to prevent an infinite loop."))
                 break
 
-        for _, slot in slots.iterrows():
-            if game_index >= len(flattened):
-                break
-            home, away = flattened[game_index]
+        week_counts = {team: 0 for team in team_ids}
+        week_last_slot: dict[str, int] = {}
+        week_pairs: set[tuple[str, str]] = set()
+
+        for slot_index, (_, slot) in enumerate(slots.iterrows(), start=1):
+            candidates = []
+            for team_a, team_b in all_pairs:
+                if not valid_pair_for_slot(team_a, team_b, slot_index, week_counts, week_last_slot, week_pairs):
+                    continue
+                candidate_score = score_pair(
+                    team_a,
+                    team_b,
+                    int(slot["SlotOrder"]),
+                    max_slot_order,
+                    week,
+                    stats,
+                    week_counts,
+                )
+                candidates.append((candidate_score, team_a, team_b))
+
+            if not candidates:
+                audit_rows.append(audit(
+                    league_id,
+                    league_name,
+                    "Error",
+                    week,
+                    week_date,
+                    slot["Time"],
+                    "Unable to fill game slot",
+                    "No valid matchup found without violating hard rules.",
+                ))
+                schedule_rows.append({
+                    "LeagueID": league_id,
+                    "LeagueName": league_name,
+                    "Week": week,
+                    "Date": week_date.isoformat(),
+                    "Time": slot["Time"],
+                    "SlotOrder": int(slot["SlotOrder"]),
+                    "HomeTeamID": "",
+                    "HomeTeam": "",
+                    "AwayTeamID": "",
+                    "AwayTeam": "",
+                    "Notes": "",
+                    "Flag": "OPEN",
+                    "FlagReason": "No valid matchup found",
+                })
+                continue
+
+            candidates.sort(key=lambda item: item[0])
+            _, team_a, team_b = candidates[0]
+            home, away = choose_home_away(team_a, team_b, stats)
+            pk = pair_key(home, away)
+
+            notes = []
+            for team in (home, away):
+                if week_counts[team] == 1:
+                    stats["doubleheaders"][team] += 1
+                    notes.append(f"{team_map.get(team, team)} doubleheader")
+
             schedule_rows.append({
                 "LeagueID": league_id,
                 "LeagueName": league_name,
@@ -201,15 +346,31 @@ def build_league_schedule(
                 "HomeTeam": team_map.get(home, home),
                 "AwayTeamID": away,
                 "AwayTeam": team_map.get(away, away),
-                "Notes": "",
+                "Notes": "; ".join(notes),
                 "Flag": "",
                 "FlagReason": "",
             })
-            game_index += 1
+
+            for team in (home, away):
+                stats["games"][team] += 1
+                week_counts[team] += 1
+                week_last_slot[team] = slot_index
+                if int(slot["SlotOrder"]) == max_slot_order:
+                    stats["late"][team] += 1
+
+            stats["home"][home] += 1
+            stats["opponent_counts"][pk] = stats["opponent_counts"].get(pk, 0) + 1
+            stats["last_met_week"][pk] = week
+            week_pairs.add(pk)
+
+        for team, count in week_counts.items():
+            if count == 0:
+                stats["byes"][team] += 1
+
         week_date = week_date + timedelta(days=7)
 
     schedule = pd.DataFrame(schedule_rows, columns=SCHEDULE_COLUMNS)
-    audit_rows.extend(audit_schedule(schedule, team_ids, team_map, league_id, league_name))
+    audit_rows.extend(audit_schedule(schedule, team_ids, team_map, league_id, league_name, stats))
     return schedule, pd.DataFrame(audit_rows, columns=AUDIT_COLUMNS)
 
 
@@ -227,7 +388,14 @@ def audit(league_id, league_name, severity, week, day, time, issue, details, row
     }
 
 
-def audit_schedule(schedule: pd.DataFrame, team_ids: List[str], team_map: Dict[str, str], league_id: str, league_name: str) -> List[Dict[str, Any]]:
+def audit_schedule(
+    schedule: pd.DataFrame,
+    team_ids: List[str],
+    team_map: Dict[str, str],
+    league_id: str,
+    league_name: str,
+    stats: dict | None = None,
+) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if schedule.empty:
         return rows
@@ -235,31 +403,105 @@ def audit_schedule(schedule: pd.DataFrame, team_ids: List[str], team_map: Dict[s
     counts = {tid: 0 for tid in team_ids}
     home_counts = {tid: 0 for tid in team_ids}
     late_counts = {tid: 0 for tid in team_ids}
-    max_slot = schedule["SlotOrder"].max()
+    byes = {tid: 0 for tid in team_ids}
+    doubleheaders = {tid: 0 for tid in team_ids}
 
+    max_slot = schedule["SlotOrder"].dropna().max()
+
+    weekly_counts: dict[tuple[int, str], list[int]] = {}
     for i, game in schedule.iterrows():
         home = clean_str(game["HomeTeamID"])
         away = clean_str(game["AwayTeamID"])
+        if not home or not away:
+            continue
+
         for tid in [home, away]:
             counts[tid] = counts.get(tid, 0) + 1
+            weekly_counts.setdefault((int(game["Week"]), tid), []).append(int(game["SlotOrder"]))
             if int(game["SlotOrder"]) == int(max_slot):
                 late_counts[tid] = late_counts.get(tid, 0) + 1
+
         home_counts[home] = home_counts.get(home, 0) + 1
+
         if home == away:
             rows.append(audit(league_id, league_name, "Error", game["Week"], game["Date"], game["Time"], "Team scheduled against itself", home, f"Schedule row {i+2}"))
 
+    weeks = sorted(pd.to_numeric(schedule["Week"], errors="coerce").dropna().astype(int).unique())
+    for week in weeks:
+        for tid in team_ids:
+            slot_list = weekly_counts.get((week, tid), [])
+            if not slot_list:
+                byes[tid] += 1
+            if len(slot_list) > 1:
+                doubleheaders[tid] += 1
+                sorted_slots = sorted(slot_list)
+                if len(sorted_slots) != 2 or sorted_slots[1] != sorted_slots[0] + 1:
+                    rows.append(audit(
+                        league_id,
+                        league_name,
+                        "Error",
+                        week,
+                        "",
+                        "",
+                        "Non-consecutive doubleheader",
+                        f"{team_map.get(tid, tid)} has a doubleheader that is not back-to-back.",
+                    ))
+
     game_values = list(counts.values())
     if game_values and max(game_values) - min(game_values) > 1:
-        rows.append(audit(league_id, league_name, "Warning", None, None, None, "Uneven games per team", str(counts)))
+        rows.append(audit(league_id, league_name, "Warning", None, None, None, "Uneven games per team", format_team_counts(counts, team_map)))
+
+    bye_values = list(byes.values())
+    if bye_values and max(bye_values) - min(bye_values) > 1:
+        rows.append(audit(league_id, league_name, "Warning", None, None, None, "Uneven bye count", format_team_counts(byes, team_map)))
+
+    dh_values = list(doubleheaders.values())
+    if dh_values and max(dh_values) - min(dh_values) > 1:
+        rows.append(audit(league_id, league_name, "Info", None, None, None, "Uneven doubleheader count", format_team_counts(doubleheaders, team_map)))
 
     for tid in team_ids:
         away_count = counts[tid] - home_counts.get(tid, 0)
         if abs(home_counts.get(tid, 0) - away_count) > 2:
-            rows.append(audit(league_id, league_name, "Warning", None, None, None, "Home/away imbalance", f"{team_map.get(tid, tid)}: home {home_counts.get(tid, 0)}, away {away_count}"))
-        if late_counts.get(tid, 0) > max(1, round(counts[tid] * 0.6)):
-            rows.append(audit(league_id, league_name, "Info", None, None, None, "Late slot concentration", f"{team_map.get(tid, tid)} has {late_counts.get(tid, 0)} late games out of {counts[tid]}."))
+            rows.append(audit(
+                league_id,
+                league_name,
+                "Warning",
+                None,
+                None,
+                None,
+                "Home/away imbalance",
+                f"{team_map.get(tid, tid)}: home {home_counts.get(tid, 0)}, away {away_count}",
+            ))
 
+        if counts.get(tid, 0) and late_counts.get(tid, 0) > max(1, round(counts[tid] * 0.6)):
+            rows.append(audit(
+                league_id,
+                league_name,
+                "Info",
+                None,
+                None,
+                None,
+                "Late slot concentration",
+                f"{team_map.get(tid, tid)} has {late_counts.get(tid, 0)} late games out of {counts[tid]}.",
+            ))
+
+    summary = {
+        team_map.get(tid, tid): {
+            "games": counts.get(tid, 0),
+            "home": home_counts.get(tid, 0),
+            "away": counts.get(tid, 0) - home_counts.get(tid, 0),
+            "byes": byes.get(tid, 0),
+            "doubleheaders": doubleheaders.get(tid, 0),
+            "late": late_counts.get(tid, 0),
+        }
+        for tid in team_ids
+    }
+    rows.append(audit(league_id, league_name, "Info", None, None, None, "Schedule balance summary", str(summary)))
     return rows
+
+
+def format_team_counts(counts: dict[str, int], team_map: dict[str, str]) -> str:
+    return ", ".join(f"{team_map.get(team, team)}={value}" for team, value in counts.items())
 
 
 def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -280,4 +522,3 @@ def build_all_schedules(tables: Dict[str, pd.DataFrame]) -> tuple[pd.DataFrame, 
     schedule_out = pd.concat(all_schedule, ignore_index=True) if all_schedule else pd.DataFrame(columns=SCHEDULE_COLUMNS)
     audit_out = pd.concat(all_audit, ignore_index=True) if all_audit else pd.DataFrame(columns=AUDIT_COLUMNS)
     return schedule_out, audit_out
-
