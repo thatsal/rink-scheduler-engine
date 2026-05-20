@@ -40,6 +40,12 @@ SCHEDULE_WEIGHTS = {
 MAX_GAMES_PER_TEAM_PER_WEEK = 2
 DOUBLEHEADERS_MUST_BE_BACK_TO_BACK = True
 
+# If time slots are provided, the scheduler treats them as intended-use slots.
+# Weekly capacity is slots * 2 team appearances. Example: 7 teams + 4 slots
+# means 8 appearances, so everyone plays and one team gets a doubleheader.
+USE_ALL_LISTED_SLOTS_WHEN_POSSIBLE = True
+
+
 
 def truthy(value: Any) -> bool:
     if isinstance(value, bool):
@@ -132,6 +138,64 @@ def choose_home_away(team_a: str, team_b: str, stats: dict) -> tuple[str, str]:
     return team_b, team_a
 
 
+def calculate_week_targets(
+    team_ids: List[str],
+    slot_count: int,
+    stats: dict,
+) -> dict[str, int]:
+    """Return how many times each team should play this week.
+
+    This is capacity-based, not odd/even based.
+
+    Examples:
+    - 8 teams / 4 slots = everyone plays once
+    - 7 teams / 4 slots = everyone plays once, one team plays twice
+    - 9 teams / 4 slots = 8 teams play once, one team has a bye
+    """
+    capacity = slot_count * 2
+    team_count = len(team_ids)
+    targets = {team: 0 for team in team_ids}
+
+    if team_count == 0 or slot_count == 0:
+        return targets
+
+    if capacity >= team_count:
+        # Everyone should play once before anyone is asked to doubleheader.
+        for team in team_ids:
+            targets[team] = 1
+
+        extra_appearances = min(capacity - team_count, team_count)
+        if extra_appearances > 0:
+            # Give extra appearances to teams that need games and have had fewer doubleheaders.
+            extra_candidates = sorted(
+                team_ids,
+                key=lambda t: (
+                    stats["doubleheaders"].get(t, 0),
+                    stats["games"].get(t, 0),
+                    stats["late"].get(t, 0),
+                    t,
+                ),
+            )
+            for team in extra_candidates[:extra_appearances]:
+                targets[team] = 2
+    else:
+        # Not enough slots for everyone. Sit the teams that can best absorb a bye.
+        play_count = capacity
+        play_candidates = sorted(
+            team_ids,
+            key=lambda t: (
+                stats["games"].get(t, 0),
+                -stats["byes"].get(t, 0),
+                stats["late"].get(t, 0),
+                t,
+            ),
+        )
+        for team in play_candidates[:play_count]:
+            targets[team] = 1
+
+    return targets
+
+
 def valid_pair_for_slot(
     team_a: str,
     team_b: str,
@@ -139,6 +203,7 @@ def valid_pair_for_slot(
     week_counts: dict[str, int],
     week_last_slot: dict[str, int],
     week_pairs: set[tuple[str, str]],
+    week_targets: dict[str, int],
 ) -> bool:
     if team_a == team_b:
         return False
@@ -147,6 +212,8 @@ def valid_pair_for_slot(
 
     for team in (team_a, team_b):
         if week_counts.get(team, 0) >= MAX_GAMES_PER_TEAM_PER_WEEK:
+            return False
+        if week_counts.get(team, 0) >= week_targets.get(team, 0):
             return False
 
         # If this would be the team's second game this week, require it to be
@@ -166,21 +233,39 @@ def score_pair(
     current_week: int,
     stats: dict,
     week_counts: dict[str, int],
+    week_targets: dict[str, int],
 ) -> float:
     teams = (team_a, team_b)
     min_games = min(stats["games"].values()) if stats["games"] else 0
     score = 0.0
 
-    # Prefer teams with fewer total games.
+    # Capacity target pressure: teams that still need appearances this week are preferred.
+    remaining_targets = {}
+    for team in teams:
+        remaining_target = week_targets.get(team, 0) - week_counts.get(team, 0)
+        remaining_targets[team] = remaining_target
+        score -= remaining_target * 120
+
+    # Avoid starting two doubleheader target teams in the same game when possible;
+    # it can make the next slot impossible without repeating the same matchup.
+    if all(week_targets.get(team, 0) >= 2 and week_counts.get(team, 0) == 0 for team in teams):
+        score += 500
+
+    # Prefer teams with fewer total games across the season.
     for team in teams:
         score += (stats["games"][team] - min_games) * SCHEDULE_WEIGHTS["balance_games"]
 
-    # Controlled doubleheaders are allowed, but avoid them unless they help fill/balance the schedule.
+    # Controlled doubleheaders are allowed when the slot capacity calls for them,
+    # but spread them fairly across the season.
     for team in teams:
         if week_counts.get(team, 0) == 1:
             score += SCHEDULE_WEIGHTS["doubleheader_penalty"]
+            score += stats["doubleheaders"].get(team, 0) * 65
+            # If this team was selected as a weekly doubleheader target, reduce penalty.
+            if week_targets.get(team, 0) >= 2:
+                score -= 80
             # If a team has fewer games overall, doubleheader is less bad.
-            score -= max(0, min_games + 1 - stats["games"][team]) * 10
+            score -= max(0, min_games + 1 - stats["games"][team]) * 20
 
     # Avoid too many late games.
     if int(slot_order) == int(max_slot_order):
@@ -285,11 +370,12 @@ def build_league_schedule(
         week_counts = {team: 0 for team in team_ids}
         week_last_slot: dict[str, int] = {}
         week_pairs: set[tuple[str, str]] = set()
+        week_targets = calculate_week_targets(team_ids, len(slots), stats)
 
         for slot_index, (_, slot) in enumerate(slots.iterrows(), start=1):
             candidates = []
             for team_a, team_b in all_pairs:
-                if not valid_pair_for_slot(team_a, team_b, slot_index, week_counts, week_last_slot, week_pairs):
+                if not valid_pair_for_slot(team_a, team_b, slot_index, week_counts, week_last_slot, week_pairs, week_targets):
                     continue
                 candidate_score = score_pair(
                     team_a,
@@ -299,8 +385,39 @@ def build_league_schedule(
                     week,
                     stats,
                     week_counts,
+                    week_targets,
                 )
                 candidates.append((candidate_score, team_a, team_b))
+
+            urgent_teams = [
+                team for team in team_ids
+                if week_targets.get(team, 0) >= 2
+                and week_counts.get(team, 0) == 1
+                and week_last_slot.get(team) == slot_index - 1
+            ]
+            if urgent_teams:
+                filtered = [
+                    item for item in candidates
+                    if item[1] in urgent_teams or item[2] in urgent_teams
+                ]
+                if filtered:
+                    candidates = filtered
+            else:
+                # If a team needs a doubleheader and has not started it yet, try to start
+                # that back-to-back pair while there is still a following slot available.
+                setup_teams = [
+                    team for team in team_ids
+                    if week_targets.get(team, 0) >= 2
+                    and week_counts.get(team, 0) == 0
+                    and slot_index < len(slots)
+                ]
+                if setup_teams:
+                    filtered = [
+                        item for item in candidates
+                        if item[1] in setup_teams or item[2] in setup_teams
+                    ]
+                    if filtered:
+                        candidates = filtered
 
             if not candidates:
                 audit_rows.append(audit(
@@ -368,6 +485,19 @@ def build_league_schedule(
             stats["opponent_counts"][pk] = stats["opponent_counts"].get(pk, 0) + 1
             stats["last_met_week"][pk] = week
             week_pairs.add(pk)
+
+        for team, target in week_targets.items():
+            if week_counts.get(team, 0) < target:
+                audit_rows.append(audit(
+                    league_id,
+                    league_name,
+                    "Warning",
+                    week,
+                    week_date,
+                    None,
+                    "Weekly target not met",
+                    f"{team_map.get(team, team)} targeted for {target} game(s), scheduled {week_counts.get(team, 0)}.",
+                ))
 
         for team, count in week_counts.items():
             if count == 0:
@@ -535,6 +665,23 @@ def audit_schedule(
                         "Non-consecutive doubleheader",
                         f"{team_map.get(tid, tid)} has a doubleheader that is not back-to-back.",
                     ))
+
+    # Capacity-based sanity checks: if weekly slots could cover all teams, byes should be rare/unexpected.
+    slot_count = len(schedule["SlotOrder"].dropna().unique()) if not schedule.empty else 0
+    weekly_capacity = slot_count * 2
+    if weekly_capacity >= len(team_ids):
+        unexpected_byes = {tid: val for tid, val in byes.items() if val > 0}
+        if unexpected_byes:
+            rows.append(audit(
+                league_id,
+                league_name,
+                "Warning",
+                None,
+                None,
+                None,
+                "Unexpected bye with enough slot capacity",
+                format_team_counts(unexpected_byes, team_map),
+            ))
 
     game_values = list(counts.values())
     if game_values and max(game_values) - min(game_values) > 1:
