@@ -29,12 +29,18 @@ SUMMARY_COLUMNS = [
 # MVP scheduling preferences.
 # Lower score = better option.
 SCHEDULE_WEIGHTS = {
-    "balance_games": 100,
-    "balance_home_away": 35,
-    "balance_late_games": 25,
-    "avoid_repeat_opponent": 30,
-    "avoid_recent_repeat": 60,
-    "doubleheader_penalty": 18,
+    # Strongest priority: keep total games tight.
+    "balance_games": 240,
+    # Doubleheaders are allowed, but should be spread around.
+    "balance_doubleheaders": 140,
+    "doubleheader_penalty": 30,
+    # Home/away still matters, but not more than total games.
+    "balance_home_away": 45,
+    # Late slot balance matters because nobody wants to live in the last game.
+    "balance_late_games": 50,
+    # Repeat-opponent spacing.
+    "avoid_repeat_opponent": 45,
+    "avoid_recent_repeat": 130,
 }
 
 MAX_GAMES_PER_TEAM_PER_WEEK = 2
@@ -170,8 +176,11 @@ def calculate_week_targets(
             extra_candidates = sorted(
                 team_ids,
                 key=lambda t: (
-                    stats["doubleheaders"].get(t, 0),
+                    # First give extra games to teams behind in games.
                     stats["games"].get(t, 0),
+                    # Then spread doubleheaders fairly.
+                    stats["doubleheaders"].get(t, 0),
+                    # Then avoid piling on late games.
                     stats["late"].get(t, 0),
                     t,
                 ),
@@ -237,6 +246,8 @@ def score_pair(
 ) -> float:
     teams = (team_a, team_b)
     min_games = min(stats["games"].values()) if stats["games"] else 0
+    max_games = max(stats["games"].values()) if stats["games"] else 0
+    min_doubleheaders = min(stats["doubleheaders"].values()) if stats["doubleheaders"] else 0
     score = 0.0
 
     # Capacity target pressure: teams that still need appearances this week are preferred.
@@ -251,27 +262,42 @@ def score_pair(
     if all(week_targets.get(team, 0) >= 2 and week_counts.get(team, 0) == 0 for team in teams):
         score += 500
 
-    # Prefer teams with fewer total games across the season.
+    # Prefer teams with fewer total games across the season. This is intentionally
+    # heavy: a pretty schedule is not useful if the game counts drift.
     for team in teams:
-        score += (stats["games"][team] - min_games) * SCHEDULE_WEIGHTS["balance_games"]
+        current_games = stats["games"][team]
+        score += (current_games - min_games) * SCHEDULE_WEIGHTS["balance_games"]
+
+        # Extra protection: strongly avoid giving more games to teams that are
+        # already ahead of the league minimum.
+        projected_week_games = week_counts.get(team, 0) + 1
+        if current_games > min_games and projected_week_games > 0:
+            score += (current_games - min_games) * 180
+        if max_games - min_games >= 1 and current_games == max_games:
+            score += 160
 
     # Controlled doubleheaders are allowed when the slot capacity calls for them,
     # but spread them fairly across the season.
     for team in teams:
         if week_counts.get(team, 0) == 1:
             score += SCHEDULE_WEIGHTS["doubleheader_penalty"]
-            score += stats["doubleheaders"].get(team, 0) * 65
+            score += (stats["doubleheaders"].get(team, 0) - min_doubleheaders) * SCHEDULE_WEIGHTS["balance_doubleheaders"]
+            score += stats["doubleheaders"].get(team, 0) * 25
             # If this team was selected as a weekly doubleheader target, reduce penalty.
             if week_targets.get(team, 0) >= 2:
-                score -= 80
+                score -= 120
             # If a team has fewer games overall, doubleheader is less bad.
-            score -= max(0, min_games + 1 - stats["games"][team]) * 20
+            score -= max(0, min_games + 1 - stats["games"][team]) * 70
 
     # Avoid too many late games.
     if int(slot_order) == int(max_slot_order):
         min_late = min(stats["late"].values()) if stats["late"] else 0
         for team in teams:
             score += (stats["late"][team] - min_late) * SCHEDULE_WEIGHTS["balance_late_games"]
+            # Small extra nudge: if a team is already ahead in games, avoid also
+            # handing them the late slot.
+            if stats["games"][team] > min_games:
+                score += 60
 
     # Avoid repeat opponents and especially recent repeat opponents.
     pk = pair_key(team_a, team_b)
@@ -412,12 +438,22 @@ def build_league_schedule(
                     and slot_index < len(slots)
                 ]
                 if setup_teams:
-                    filtered = [
+                    # Prefer exactly one setup team in the matchup. Pairing two
+                    # doubleheader-target teams together can make it impossible
+                    # to finish both back-to-back runs in the next slot.
+                    exact_one_setup = [
                         item for item in candidates
-                        if item[1] in setup_teams or item[2] in setup_teams
+                        if ((item[1] in setup_teams) ^ (item[2] in setup_teams))
                     ]
-                    if filtered:
-                        candidates = filtered
+                    if exact_one_setup:
+                        candidates = exact_one_setup
+                    else:
+                        filtered = [
+                            item for item in candidates
+                            if item[1] in setup_teams or item[2] in setup_teams
+                        ]
+                        if filtered:
+                            candidates = filtered
 
             if not candidates:
                 audit_rows.append(audit(
