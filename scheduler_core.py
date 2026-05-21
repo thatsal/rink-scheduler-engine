@@ -37,9 +37,12 @@ SCHEDULE_WEIGHTS = {
     # Home/away still matters, but not more than total games.
     "balance_home_away": 45,
     # Balance all time slots, not just the latest slot.
-    "balance_time_slots": 70,
+    "balance_time_slots": 105,
+    # Prevent a team from repeatedly landing in the same slot week after week.
+    "avoid_recent_same_slot": 95,
+    "avoid_recent_slot_pattern": 45,
     # Last slot still gets a small extra penalty because late games usually feel worse.
-    "extra_late_slot": 20,
+    "extra_late_slot": 18,
     # Repeat-opponent spacing.
     "avoid_repeat_opponent": 45,
     "avoid_recent_repeat": 130,
@@ -308,14 +311,40 @@ def score_pair(
     # had fewer Slot 2 games. This prevents teams from getting stuck in a
     # repeated time pattern, not just too many late games.
     min_this_slot = min(team_slot_count(t, slot_order, stats) for t in stats["games"]) if stats.get("games") else 0
+    league_game_avg = (sum(stats["games"].values()) / len(stats["games"])) if stats.get("games") else 0
     for team in teams:
         this_slot_count = team_slot_count(team, slot_order, stats)
         score += (this_slot_count - min_this_slot) * SCHEDULE_WEIGHTS["balance_time_slots"]
+
+        # Stronger pressure when a team is already above its expected share
+        # of this specific time slot. Example: after 12 games and 4 slots,
+        # a team should be around 3 games per slot, not 6 in one slot.
+        slot_count_total = max(1, len(stats.get("slot_counts", {}).get(team, {})))
+        expected_slot_share = max(1.0, (stats["games"].get(team, 0) + 1) / slot_count_total)
+        if this_slot_count >= expected_slot_share + 1:
+            score += (this_slot_count - expected_slot_share + 1) * 55
+
+        # Penalize repeated slot patterns. This is separate from total slot
+        # count: even if totals look okay, nobody wants the same slot pattern
+        # over and over.
+        last_slot = stats.get("last_slot", {}).get(team)
+        if last_slot == int(slot_order):
+            score += SCHEDULE_WEIGHTS["avoid_recent_same_slot"]
+
+        recent_slots = stats.get("recent_slots", {}).get(team, [])[-3:]
+        score += recent_slots.count(int(slot_order)) * SCHEDULE_WEIGHTS["avoid_recent_slot_pattern"]
+
         # Also penalize the projected per-team slot spread after this game.
         projected_counts = dict(stats.get("slot_counts", {}).get(team, {}))
         projected_counts[int(slot_order)] = projected_counts.get(int(slot_order), 0) + 1
         if projected_counts:
-            score += (max(projected_counts.values()) - min(projected_counts.values())) * 35
+            score += (max(projected_counts.values()) - min(projected_counts.values())) * 55
+
+        # If total games are already comfortably balanced, let slot fairness
+        # matter a little more. If total games are not balanced, game count
+        # still wins because GP drift is worse than slot drift.
+        if stats["games"].get(team, 0) >= league_game_avg:
+            score += this_slot_count * 12
 
     # Keep a smaller extra penalty for the last slot because it usually feels
     # worse than other times, but it is no longer the only slot being balanced.
@@ -404,6 +433,8 @@ def build_league_schedule(
         "doubleheaders": {team: 0 for team in team_ids},
         "opponent_counts": {},
         "last_met_week": {},
+        "last_slot": {team: None for team in team_ids},
+        "recent_slots": {team: [] for team in team_ids},
     }
 
     all_pairs = list(combinations(team_ids, 2))
@@ -546,6 +577,9 @@ def build_league_schedule(
                 slot_order_value = int(slot["SlotOrder"])
                 stats["slot_counts"].setdefault(team, {}).setdefault(slot_order_value, 0)
                 stats["slot_counts"][team][slot_order_value] += 1
+                stats["last_slot"][team] = slot_order_value
+                stats["recent_slots"].setdefault(team, []).append(slot_order_value)
+                stats["recent_slots"][team] = stats["recent_slots"][team][-5:]
                 if slot_order_value == max_slot_order:
                     stats["late"][team] += 1
 
